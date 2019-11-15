@@ -67,12 +67,15 @@ class MultiFidelityModel():
         actions = []
         action_cost = 0
         threshold = 1/np.sqrt(self.B)
+        total_cost = 0
         # TODO
         return set(), total_cost
 
     def sf_gp_opt(self):
         candidate, acq_value = optimize_acqf(self.acq_fn, bounds=self.bounds, q=self.num_candidates, num_restarts=self.num_restarts, raw_samples=self.raw_samples)
-        return torch.max(candidate)
+        acq_vals = acq_value.cpu().numpy()
+        idx, = np.where(acq_vals == np.max(acq_vals))
+        return candidate[idx]
 
     def optimize(self):
         while self.B > 0:
@@ -81,4 +84,7 @@ class MultiFidelityModel():
             self.selected.update(L)
             self.selected.add((x, self.num_fidel-1))
             self.B -= total_cost + self.costs[-1]
+            # update posterior
         return x #?
+
+    
