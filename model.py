@@ -89,9 +89,12 @@ class MultiFidelityModel():
         cov_2 = self.covariance_across_noise(e_ls, L_copy)
         print("cov_1 = 0: {}".format(torch.det(cov_1) == 0))
         print("cov_2 = 0: {}".format(torch.det(cov_2) == 0))
+        print("cov_1: {}, cov_2: {}".format(torch.isnan(cov_1).any(), torch.isnan(cov_2).any()))
+
         return torch.logdet(cov_1) - torch.logdet(cov_2)
 
     def covariance_across_levels(self, f_ls, points):
+        # check this
         cov = torch.tensor([]).to(self.device)
         for i, (x1, l1) in enumerate(points):
             cov_row = torch.tensor([]).to(self.device)
@@ -134,9 +137,9 @@ class MultiFidelityModel():
                 for i, x_l in enumerate(X):
                     for fidel in range(self.num_fidel):
                         if fidel == 0:
-                            ig = self.information_gain_single_point_target(x_l)
+                            ig = self.information_gain_single_point_target(x_l) / self.costs[fidel]
                         else:
-                            ig = self.information_gain_single_point(x_l, fidel)
+                            ig = self.information_gain_single_point(x_l, fidel) / self.costs[fidel]
                         if ig > best_ig and (self.B - action_cost - self.costs[fidel]) > 0:
                             best_ig = ig
                             l = fidel
@@ -155,7 +158,7 @@ class MultiFidelityModel():
             elif l == 0:
                 print("stopped exploring since querying target is best action")
                 return actions_fidel, 0
-            elif self.information_gain_set(x, l, actions_fidel, f_ls_initial, e_ls_initial) < threshold:
+            elif self.information_gain_set(x, l, actions_fidel, f_ls_initial, e_ls_initial) / (action_cost + self.costs[l]) < threshold:
                 print("stopped exploring since info gain ratio low")
                 return actions_fidel, 0
             else:
@@ -185,6 +188,7 @@ class MultiFidelityModel():
         if self.is_discrete:
             X, _ = self.true_fns
             acq_vals = acq_fn(X.unsqueeze(1))
+            # remove point already queried
             argmax = torch.argmax(acq_vals)
             max_val = torch.max(acq_vals)
             return X[argmax], argmax, max_val

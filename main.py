@@ -31,8 +31,11 @@ def main():
     args = parser.parse_args()
 
     X, Y, _, _ = load_data(args.dataset)
-    # start with 5% of dataset
-    idx = int(X.size(0) * 0.05)
+    idx = 2
+    # randomize
+    
+    # fidelity level doesn't need same 10 points
+    # debug with 2 or 3
     train_x = X[:idx, :].contiguous()
     train_y = Y[:idx, :].contiguous()
 
