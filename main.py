@@ -20,7 +20,7 @@ def load_data(dataset):
 
 def main():
     parser = argparse.ArgumentParser(description='MF-MI-Greedy')
-    parser.add_argument('--budget', type=float, default=1000, help='budget')
+    parser.add_argument('--budget', type=float, default=900, help='budget')
     parser.add_argument('--num-fidelity', type=int, default=3, metavar='m', help='number of fidelities')
     parser.add_argument('--fidelity-costs', type=list, default=[9, 2.25, 1], help='cost of each fidelity level')
     parser.add_argument('--dataset', type=str, default='nanophotonics', choices=['nanophotonics', 'astronomy'],
@@ -30,9 +30,9 @@ def main():
     parser.add_argument('--acquisition-function', type=str, default="UCB", choices=["UCB", "EI"], help='acquisition function')
     args = parser.parse_args()
 
-    X, Y, minsx, maxsx = load_data(args.dataset)
-    # start with 10% of dataset
-    idx = int(X.size(0) * 0.1)
+    X, Y, _, _ = load_data(args.dataset)
+    # start with 5% of dataset
+    idx = int(X.size(0) * 0.05)
     train_x = X[:idx, :].contiguous()
     train_y = Y[:idx, :].contiguous()
 

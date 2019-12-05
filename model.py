@@ -43,10 +43,10 @@ class MultiFidelityModel():
             'RBF': ScaleKernel(RBFKernel()),
             'Matern': ScaleKernel(MaternKernel())
         }
-        train_Xs = train_Xs.to(self.device)
-        train_Ys = train_Ys.to(self.device)
+        self.train_Xs = train_Xs.to(self.device)
+        self.train_Ys = train_Ys.to(self.device)
 
-        self.f_m = SingleTaskGP(train_Xs, train_Ys[:, 0].unsqueeze(1), 
+        self.f_m = SingleTaskGP(train_Xs, train_Ys[:, 0].unsqueeze(1),
                 covar_module=kernels[kernel_name]).to(self.device)
         mll = ExactMarginalLogLikelihood(self.f_m.likelihood, self.f_m)
         fit_gpytorch_model(mll)
@@ -55,6 +55,10 @@ class MultiFidelityModel():
         self.B = total_budget
         self.selected = set()
         self.num_fidel = num_fidel
+        self.selected_tensors_X = [train_Xs] * self.num_fidel
+        self.selected_tensors_Y = []
+        for i in range(self.num_fidel):
+            self.selected_tensors_Y.append(train_Ys[:, i].unsqueeze(1))
         # initialize GPs for each fidelity level
         self.e_ls = [0]
         self.f_ls = [0]
@@ -72,17 +76,20 @@ class MultiFidelityModel():
             self.acq_fn_name = acq_fn_name
 
     def information_gain_single_point(self, x, l):
-        return torch.det(self.f_ls[l].covar_module(x, x).evaluate()) - torch.det(self.e_ls[l].covar_module(x, x).evaluate())
+        return torch.logdet(self.f_ls[l].covar_module(x, x).evaluate()) - \
+               torch.logdet(self.e_ls[l].covar_module(x, x).evaluate())
 
     def information_gain_single_point_target(self, x):
-        return torch.det(self.f_m.covar_module(x, x).evaluate())
+        return torch.logdet(self.f_m.covar_module(x, x).evaluate())
 
     def information_gain_set(self, x, l, L, f_ls, e_ls):
         L_copy = deepcopy(L)
-        L_copy.append((x, l))
+        L_copy.add((x, l))
         cov_1 = self.covariance_across_levels(f_ls, L_copy)
         cov_2 = self.covariance_across_noise(e_ls, L_copy)
-        return torch.det(cov_1) - torch.det(cov_2)
+        print("cov_1 = 0: {}".format(torch.det(cov_1) == 0))
+        print("cov_2 = 0: {}".format(torch.det(cov_2) == 0))
+        return torch.logdet(cov_1) - torch.logdet(cov_2)
 
     def covariance_across_levels(self, f_ls, points):
         cov = torch.tensor([]).to(self.device)
@@ -113,10 +120,11 @@ class MultiFidelityModel():
         f_ls_initial = deepcopy(self.f_ls)
         e_ls_initial = deepcopy(self.e_ls)
 
-        actions_fidel = []
+        actions_fidel = set()
         action_cost = 0
-        threshold = 1/np.sqrt(self.B)
+        threshold = 1
         while True:
+            print("exploring...")
             if self.is_discrete:
                 X, Y = self.true_fns
                 best_ig = -math.inf
@@ -134,7 +142,6 @@ class MultiFidelityModel():
                             l = fidel
                             x = x_l
                             x_idx = i
-
             else:
                 # use optimizer to get argmax
                 # iterate over each fidelity level
@@ -144,26 +151,31 @@ class MultiFidelityModel():
 
             if l == None:
                 print("stopped exploring due to no budget")
-                return set(actions_fidel), 0
+                return actions_fidel, 0
             elif l == 0:
                 print("stopped exploring since querying target is best action")
-                return set(actions_fidel), 0
+                return actions_fidel, 0
             elif self.information_gain_set(x, l, actions_fidel, f_ls_initial, e_ls_initial) < threshold:
                 print("stopped exploring since info gain ratio low")
-                return set(actions_fidel), 0
+                return actions_fidel, 0
             else:
-                actions_fidel.append((x, l))
+                print(x)
+                print(self.information_gain_set(x, l, actions_fidel, f_ls_initial, e_ls_initial))
+                actions_fidel.add((x, l))
                 action_cost += self.costs[l]
-                # need to call my model first before I can update posterior
-                self.f_ls[l](x.unsqueeze(0))
-                if self.is_discrete:
-                    self.f_ls[l] = self.f_ls[l].condition_on_observations(x.unsqueeze(0),
-                                                                          Y[x_idx][l].unsqueeze(0).unsqueeze(0))
-                else:
-                    self.f_ls[l] = self.f_ls[l].condition_on_observations(x.unsqueeze(0),
-                                                                          self.true_fns[l](x).unsqueeze(0).unsqueeze(0))
+                self.selected_tensors_X[l] = torch.cat([self.selected_tensors_X[l], x.unsqueeze(0)])
+                e_l_covar = self.e_ls[l].covar_module
 
-        return set(actions_fidel), action_cost
+                if self.is_discrete:
+                    self.selected_tensors_Y[l] = torch.cat([self.selected_tensors_Y[l], Y[x_idx][l].unsqueeze(0).unsqueeze(0)])
+                else:
+                    pass
+                self.f_ls[l] = SingleTaskGP(self.selected_tensors_X[l], self.selected_tensors_Y[l],
+                                    covar_module=AdditiveKernel(self.f_m.covar_module, e_l_covar)).to(self.device)
+                mll = ExactMarginalLogLikelihood(self.f_ls[l].likelihood, self.f_ls[l])
+                fit_gpytorch_model(mll)
+
+        return actions_fidel, action_cost
 
     def sf_gp_opt(self, best_f=-math.inf):
         if self.acq_fn_name == "EI":
@@ -184,7 +196,6 @@ class MultiFidelityModel():
 
     def optimize(self):
         print("beginning optimization")
-        print(self.selected)
         max_val = -math.inf # max val of acq function seen so far
         while self.B > 0:
             print("exploring lf")
@@ -192,8 +203,8 @@ class MultiFidelityModel():
             print("optimizing single fidelity")
             x, x_idx, max_val = self.sf_gp_opt(best_f=max_val)
             #total_queried = len(L) + 1
+            print("number of explored: {}".format(len(L)))
             self.selected.update(L)
-            print(self.selected)
             self.selected.add((x, 0))
             self.B -= total_cost + self.costs[0]
             print("number of queried: {}".format(len(self.selected)))
@@ -202,15 +213,18 @@ class MultiFidelityModel():
             
             # update posterior of f_m 
             print("updating posterior of f_m")
+            self.selected_tensors_X[0] = torch.cat([self.selected_tensors_X[0], x.unsqueeze(0)])
             if self.is_discrete:
                 _, Y = self.true_fns
-                self.f_m(x.unsqueeze(0))
-                self.f_m = self.f_m.condition_on_observations(x.unsqueeze(0),
-                                                              Y[x_idx][0].unsqueeze(0).unsqueeze(0))
+                self.selected_tensors_Y[0] = torch.cat([self.selected_tensors_Y[0], Y[x_idx][0].unsqueeze(0).unsqueeze(0)])
             else:
-                self.f_m = self.f_m.condition_on_observations(x.unsqueeze(0),
-                                                              self.true_fns[0](x).unsqueeze(0).unsqueeze(0))
-            
+                pass
+
+            self.f_m = SingleTaskGP(self.selected_tensors_X[0], self.selected_tensors_Y[0],
+                                        covar_module=self.f_m.covar_module).to(self.device)
+            mll = ExactMarginalLogLikelihood(self.f_m.likelihood, self.f_m)
+            fit_gpytorch_model(mll)
+
             print("current sf opt: {}".format(Y[x_idx][0]))
             print("max: {}".format(torch.max(Y).item()))
             # update hyperparameters
