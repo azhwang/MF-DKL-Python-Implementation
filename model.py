@@ -36,17 +36,16 @@ class MultiFidelityModel():
         self.true_fns = true_fns
         self.k = k
         self.is_discrete = is_discrete
-        self.bounds = torch.stack([torch.zeros(train_Xs.size(1)).to(self.device),
-                                   torch.ones(train_Xs.size(1)).to(self.device)])
         # initialize GP for target function
         kernels = {
             'RBF': ScaleKernel(RBFKernel()),
             'Matern': ScaleKernel(MaternKernel())
         }
-        self.train_Xs = train_Xs.to(self.device)
-        self.train_Ys = train_Ys.to(self.device)
 
-        self.f_m = SingleTaskGP(train_Xs, train_Ys[:, 0].unsqueeze(1),
+        self.selected_tensors_X = train_Xs
+        self.selected_tensors_Y = train_Ys
+
+        self.f_m = SingleTaskGP(train_Xs[0], train_Ys[0],
                 covar_module=kernels[kernel_name]).to(self.device)
         mll = ExactMarginalLogLikelihood(self.f_m.likelihood, self.f_m)
         fit_gpytorch_model(mll)
@@ -55,18 +54,14 @@ class MultiFidelityModel():
         self.B = total_budget
         self.selected = set()
         self.num_fidel = num_fidel
-        self.selected_tensors_X = [train_Xs] * self.num_fidel
-        self.selected_tensors_Y = []
-        for i in range(self.num_fidel):
-            self.selected_tensors_Y.append(train_Ys[:, i].unsqueeze(1))
         # initialize GPs for each fidelity level
         self.e_ls = [0]
         self.f_ls = [0]
         for i in range(1, num_fidel):
             e_l_covar = kernels[kernel_name]
-            datax = torch.zeros(train_Xs.size())
-            datay = torch.zeros(train_Ys[:, i].unsqueeze(1).size())
-            gp = SingleTaskGP(train_Xs, train_Ys[:, i].unsqueeze(1),
+            datax = torch.zeros(train_Xs[i].size())
+            datay = torch.zeros(train_Ys[i].size())
+            gp = SingleTaskGP(train_Xs[i], train_Ys[i],
                             covar_module=AdditiveKernel(self.f_m.covar_module, e_l_covar)).to(self.device)
             self.f_ls.append(gp)
             mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
@@ -84,12 +79,15 @@ class MultiFidelityModel():
 
     def information_gain_set(self, x, l, L, f_ls, e_ls):
         L_copy = deepcopy(L)
-        L_copy.add((x, l))
+        L_copy.add((tuple(x.tolist()), l))
         cov_1 = self.covariance_across_levels(f_ls, L_copy)
         cov_2 = self.covariance_across_noise(e_ls, L_copy)
-        print("cov_1 = 0: {}".format(torch.det(cov_1) == 0))
-        print("cov_2 = 0: {}".format(torch.det(cov_2) == 0))
-        print("cov_1: {}, cov_2: {}".format(torch.isnan(cov_1).any(), torch.isnan(cov_2).any()))
+        #print("cov_1")
+        #print(cov_1)
+        #print("cov_2")
+        #print(cov_2)
+        #print("cov_1 < 0: {}".format(torch.det(cov_1) < 0))
+        #print("cov_2 < 0: {}".format(torch.det(cov_2) < 0))
 
         return torch.logdet(cov_1) - torch.logdet(cov_2)
 
@@ -97,8 +95,10 @@ class MultiFidelityModel():
         # check this
         cov = torch.tensor([]).to(self.device)
         for i, (x1, l1) in enumerate(points):
+            x1 = torch.tensor(x1)
             cov_row = torch.tensor([]).to(self.device)
             for j, (x2, l2) in enumerate(points):
+                x2 = torch.tensor(x2)
                 if l1 == l2:
                     cov_row = torch.cat([cov_row, f_ls[l1].covar_module(x1, x2).evaluate()])
                 else:
@@ -110,8 +110,10 @@ class MultiFidelityModel():
     def covariance_across_noise(self, e_ls, points):
         cov = torch.tensor([]).to(self.device)
         for i, (x1, l1) in enumerate(points):
+            x1 = torch.tensor(x1)
             cov_row = torch.tensor([]).to(self.device)
             for j, (x2, l2) in enumerate(points):
+                x2 = torch.tensor(x2)
                 if l1 == l2:
                     cov_row = torch.cat([cov_row, e_ls[l1].covar_module(x1, x2).evaluate()])
                 else:
@@ -125,7 +127,7 @@ class MultiFidelityModel():
 
         actions_fidel = set()
         action_cost = 0
-        threshold = 1
+        threshold = 100
         while True:
             print("exploring...")
             if self.is_discrete:
@@ -140,7 +142,8 @@ class MultiFidelityModel():
                             ig = self.information_gain_single_point_target(x_l) / self.costs[fidel]
                         else:
                             ig = self.information_gain_single_point(x_l, fidel) / self.costs[fidel]
-                        if ig > best_ig and (self.B - action_cost - self.costs[fidel]) > 0:
+                        if ig > best_ig and (self.B - action_cost - self.costs[fidel]) > 0 and \
+                                (tuple(x_l.tolist()), fidel) not in self.selected:
                             best_ig = ig
                             l = fidel
                             x = x_l
@@ -164,7 +167,7 @@ class MultiFidelityModel():
             else:
                 print(x)
                 print(self.information_gain_set(x, l, actions_fidel, f_ls_initial, e_ls_initial))
-                actions_fidel.add((x, l))
+                actions_fidel.add((tuple(x.tolist()), l))
                 action_cost += self.costs[l]
                 self.selected_tensors_X[l] = torch.cat([self.selected_tensors_X[l], x.unsqueeze(0)])
                 e_l_covar = self.e_ls[l].covar_module
@@ -189,14 +192,20 @@ class MultiFidelityModel():
             X, _ = self.true_fns
             acq_vals = acq_fn(X.unsqueeze(1))
             # remove point already queried
-            argmax = torch.argmax(acq_vals)
-            max_val = torch.max(acq_vals)
+            argmax = 0
+            for i, val in enumerate(acq_vals):
+                if val > acq_vals[argmax] and ((tuple(X[argmax].tolist()), 0) not in self.selected):
+                    argmax = i
+            max_val = acq_vals[argmax]
+            print("picked: {}".format((tuple(X[argmax].tolist()), 0)))
+            print("in set? {}".format((tuple(X[argmax].tolist()), 0) in self.selected))
             return X[argmax], argmax, max_val
         else:
-            candidate, acq_value = optimize_acqf(acq_fn, bounds=self.bounds, q=1, num_restarts=5, raw_samples=20)
-            acq_vals = acq_value.cpu().numpy()
-            idx, = np.where(acq_vals == np.max(acq_vals))
-            return candidate[idx]
+            pass
+            #candidate, acq_value = optimize_acqf(acq_fn, bounds=self.bounds, q=1, num_restarts=5, raw_samples=20)
+            #acq_vals = acq_value.cpu().numpy()
+            #idx, = np.where(acq_vals == np.max(acq_vals))
+            #return candidate[idx]
 
     def optimize(self):
         print("beginning optimization")
@@ -209,7 +218,7 @@ class MultiFidelityModel():
             #total_queried = len(L) + 1
             print("number of explored: {}".format(len(L)))
             self.selected.update(L)
-            self.selected.add((x, 0))
+            self.selected.add((tuple(x.tolist()), 0))
             self.B -= total_cost + self.costs[0]
             print("number of queried: {}".format(len(self.selected)))
             print(self.selected)
